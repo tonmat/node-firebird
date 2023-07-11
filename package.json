@@ -1,5 +1,5 @@
 {
-    "name": "node-firebird",
+    "name": "tonmat-node-firebird",
     "version": "1.1.5",
     "description": "Pure JavaScript and Asynchronous Firebird client for Node.js.",
     "keywords": [
@@ -8,25 +8,17 @@
         "rdbms",
         "sql"
     ],
-    "homepage": "https://github.com/hgourvest/node-firebird",
+    "homepage": "https://github.com/tonmat/node-firebird",
     "repository": {
         "type": "git",
-        "url": "https://github.com/hgourvest/node-firebird"
+        "url": "https://github.com/tonmat/node-firebird"
     },
-    "author": {
-        "name": "Henri Gourvest",
-        "email": "hgourvest@gmail.com"
-    },
-    "contributors": [
-        "Popa Marius Adrian <mapopa@gmail.com>",
-        "Peter Širka <petersirka@gmail.com>"
-    ],
     "main": "./lib",
     "types": "./lib/index.d.ts",
     "licenses": [
         {
             "type": "MPL-2.0",
-            "url": "https://github.com/hgourvest/node-firebird/blob/master/LICENSE"
+            "url": "https://github.com/tonmat/node-firebird/blob/master/LICENSE"
         }
     ],
     "scripts": {
