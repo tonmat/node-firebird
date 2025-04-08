@@ -1,6 +1,6 @@
 {
     "name": "node-firebird",
-    "version": "1.1.9",
+    "version": "1.1.9b",
     "description": "Pure JavaScript and Asynchronous Firebird client for Node.js.",
     "keywords": [
         "firebird",
@@ -8,14 +8,14 @@
         "rdbms",
         "sql"
     ],
-    "homepage": "https://github.com/hgourvest/node-firebird",
+    "homepage": "https://github.com/tonmat/node-firebird",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/hgourvest/node-firebird.git"
+        "url": "git+https://github.com/tonmat/node-firebird.git"
     },
     "author": {
-        "name": "Henri Gourvest",
-        "email": "hgourvest@gmail.com"
+        "name": "Everton Matumoto",
+        "email": "everton.matumoto@gmail.com"
     },
     "contributors": [
         "Popa Marius Adrian <mapopa@gmail.com>",
