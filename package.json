@@ -1,6 +1,6 @@
 {
-    "name": "node-firebird",
-    "version": "1.1.9b",
+    "name": "tonmat-node-firebird",
+    "version": "1.1.9-b",
     "description": "Pure JavaScript and Asynchronous Firebird client for Node.js.",
     "keywords": [
         "firebird",
