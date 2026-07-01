@@ -47,25 +47,25 @@ function makeStringReader(text, nodeEncoding) {
 
 describe('resolveTextEncoding (via SQLVarText.decode)', function () {
 
-    it('defaults to utf8 when no options are provided', function () {
-        // UTF-8 multi-byte character: '€' = 0xE2 0x82 0xAC
-        const text = '€';
+    it('defaults to latin1 (fork default) when no options are provided', function () {
+        // latin1 single-byte accented character: 'á' = 0xE1
+        const text = 'Olá';
         const sqlVar = new SQLVarText();
         sqlVar.subType = 0;
-        sqlVar.length = 4; // UTF8 char width = 4
+        sqlVar.length = 12; // charLength = 12 / UTF8 width 4 = 3 chars
 
-        const reader = makeTextReader(text + ' ', 'utf8');
+        const reader = makeTextReader(text + ' '.repeat(9), 'latin1');
         const result = sqlVar.decode(reader, false /* lowerV13=false */, null);
         assert.strictEqual(result, text);
     });
 
-    it('defaults to utf8 when options object has no encoding property', function () {
+    it('defaults to latin1 (fork default) when options object has no encoding property', function () {
         const text = 'Héllo';
         const sqlVar = new SQLVarText();
         sqlVar.subType = 0;
-        sqlVar.length = 20; // 5 chars * 4 width
+        sqlVar.length = 20; // latin1: 5 bytes of text + 15 pad spaces
 
-        const reader = makeTextReader(text + ' '.repeat(14), 'utf8');
+        const reader = makeTextReader(text + ' '.repeat(15), 'latin1');
         const result = sqlVar.decode(reader, false, {});
         assert.strictEqual(result, text);
     });
@@ -299,12 +299,12 @@ describe('SQLVarString.decode – respects connection encoding', function () {
         assert.ok(result.slice(0, bytes.length).equals(bytes));
     });
 
-    it('defaults to utf8 when no options passed', function () {
-        const text = 'Hello UTF-8: ✓';
+    it('defaults to latin1 (fork default) when no options passed', function () {
+        const text = 'Olá latin1: ç';
         const sqlVar = new SQLVarString();
         sqlVar.subType = 0;
 
-        const reader = makeStringReader(text, 'utf8');
+        const reader = makeStringReader(text, 'latin1');
         const result = sqlVar.decode(reader, false);
         assert.strictEqual(result, text);
     });
