@@ -1371,3 +1371,133 @@ describe('Socket – deferred write accumulation (regression #411)', function ()
     });
 
 });
+
+// ---------------------------------------------------------------------------
+// Default READ COMMITTED isolation uses rec_version (fork change)
+//
+// With the upstream no_rec_version default, any SELECT touching a row that
+// has an uncommitted newer version blocks (waitTimeout=0 → forever) until the
+// writing transaction ends. rec_version reads the latest committed version
+// instead, so plain reads never hang behind concurrent writers.
+// ---------------------------------------------------------------------------
+
+describe('Default READ COMMITTED isolation – rec_version', function () {
+
+    it('should expose rec_version (not no_rec_version) in the READ COMMITTED constants', function () {
+        assert.ok(Firebird.ISOLATION_READ_COMMITTED.includes(Const.isc_tpb_rec_version));
+        assert.ok(!Firebird.ISOLATION_READ_COMMITTED.includes(Const.isc_tpb_no_rec_version));
+        assert.ok(Firebird.ISOLATION_READ_COMMITTED_READ_ONLY.includes(Const.isc_tpb_rec_version));
+        assert.ok(!Firebird.ISOLATION_READ_COMMITTED_READ_ONLY.includes(Const.isc_tpb_no_rec_version));
+        // The blocking upstream variant remains available for explicit opt-in.
+        assert.ok(Firebird.ISOLATION_READ_COMMITTED_NO_REC_VERSION.includes(Const.isc_tpb_no_rec_version));
+    });
+
+    it('should send rec_version in the TPB of a default startTransaction', async function () {
+        let tpb = null;
+
+        const { server, port } = await startMockServer(socket => {
+            makeFullDispatcher(socket, (s, opcode, buf) => {
+                if (opcode === Const.op_connect) {
+                    s.write(buildOpAcceptData('Legacy_Auth'));
+                } else if (opcode === Const.op_attach) {
+                    s.write(buildOpResponse(42));
+                } else if (opcode === Const.op_transaction) {
+                    const r = new XdrReader(buf);
+                    r.readInt();            // op_transaction
+                    r.readInt();            // db handle
+                    tpb = r.readArray();    // TPB bytes
+                    s.write(buildOpResponse(7));
+                } else if (opcode === Const.op_rollback) {
+                    s.write(buildOpResponse(0));
+                } else if (opcode === Const.op_detach) {
+                    s.write(buildOpResponse(0));
+                    s.end();
+                }
+                return buf.length;
+            });
+        });
+
+        try {
+            await withMockAttach(port, async db => {
+                const transaction = await new Promise((resolve, reject) =>
+                    db.startTransaction((err, tr) => (err ? reject(err) : resolve(tr))));
+
+                assert.ok(tpb, 'server should have received a TPB');
+                const bytes = Array.from(tpb);
+                assert.ok(bytes.includes(Const.isc_tpb_read_committed), 'TPB should contain isc_tpb_read_committed');
+                assert.ok(bytes.includes(Const.isc_tpb_rec_version), 'TPB should contain isc_tpb_rec_version');
+                assert.ok(!bytes.includes(Const.isc_tpb_no_rec_version), 'TPB must not contain isc_tpb_no_rec_version');
+
+                await new Promise((resolve, reject) =>
+                    transaction.rollback(err => (err ? reject(err) : resolve())));
+            });
+        } finally {
+            await stopMockServer(server);
+        }
+    });
+
+});
+
+// ---------------------------------------------------------------------------
+// Unexpected socket close with operations in flight
+//
+// Regression: requests in flight when the socket closed had their callbacks
+// carried over to the reconnected socket, where no response would ever match
+// them – the operation hung forever (and misaligned the FIFO response queue
+// after a reconnect). They must instead fail promptly, the connection must be
+// marked closed so later operations fail fast, and returning the dead
+// connection to the pool must not hang.
+// ---------------------------------------------------------------------------
+
+describe('Unexpected socket close with operations in flight', function () {
+
+    it('should fail the in-flight operation, fail fast afterwards, and release to the pool', async function () {
+        const { server, port } = await startMockServer(socket => {
+            makeDispatcher(socket, (s, opcode) => {
+                if (opcode === Const.op_connect) {
+                    s.write(buildOpAcceptData('Legacy_Auth'));
+                } else if (opcode === Const.op_attach) {
+                    s.write(buildOpResponse(42));
+                } else if (opcode === Const.op_transaction) {
+                    s.destroy();    // server/network drops mid-operation, no response
+                }
+            });
+        });
+
+        const pool = Firebird.pool(1, {
+            host:     '127.0.0.1',
+            port,
+            database: '/mock/test.fdb',
+            user:     'SYSDBA',
+            password: 'masterkey',
+        });
+
+        try {
+            const db = await new Promise((resolve, reject) =>
+                pool.get((err, d) => (err ? reject(err) : resolve(d))));
+
+            // 1. The in-flight operation must complete with an error, not hang.
+            const err = await new Promise(resolve => db.startTransaction(e => resolve(e)));
+            assert.ok(err instanceof Error, 'in-flight operation should fail with an Error');
+
+            // 2. Queues are drained and the connection is marked closed.
+            assert.strictEqual(db.connection._queue.length, 0, 'queue should be empty');
+            assert.strictEqual(db.connection._pending.length, 0, 'pending should be empty');
+            assert.strictEqual(db.connection._isClosed, true, 'connection should be marked closed');
+
+            // 3. Subsequent operations fail fast – and must not crash the
+            //    process even though nothing listens on the db 'error' event.
+            const err2 = await new Promise(resolve => db.startTransaction(e => resolve(e)));
+            assert.ok(err2 instanceof Error, 'operation on closed connection should fail');
+            assert.ok(/closed/i.test(err2.message), 'error should say the connection is closed');
+
+            // 4. Releasing the dead connection back to the pool completes
+            //    (the pool discards it instead of recycling it).
+            await new Promise(resolve => db.detach(() => resolve()));
+        } finally {
+            await new Promise(resolve => pool.destroy(resolve));
+            await stopMockServer(server);
+        }
+    });
+
+});
