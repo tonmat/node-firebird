@@ -212,6 +212,55 @@ function buildOpContAuthServer(m2Data, pluginName) {
 }
 
 /**
+ * Build an op_cond_accept frame with an EMPTY auth-data array (opcode 98).
+ * Some servers do not embed salt+key in the accept frame and instead expect
+ * the client to (re)send its public key A via op_cont_auth.
+ */
+function buildOpCondAcceptSRPEmpty(protocolVersion, pluginName) {
+    const w = new XdrWriter(64);
+    w.addInt(Const.op_cond_accept);
+    w.addInt(protocolVersion);
+    w.addInt(Const.ARCHITECTURE_GENERIC);
+    w.addInt(Const.ptype_lazy_send);
+    w.addInt(0);                              // auth data array len = 0
+    w.addString(pluginName || 'Srp', 'utf8'); // plugin name
+    w.addInt(0);                              // is_authenticated = 0
+    w.addString('', 'utf8');                  // keys = ""
+    return w.getData();
+}
+
+/**
+ * Build a server-side op_cont_auth frame carrying SRP salt + server public
+ * key B – the same BLR payload as buildOpCondAcceptSRP, but as opcode 92.
+ *
+ * @param {string} salt     Hex-encoded salt string
+ * @param {object} serverB  BigInt server public key B (ignored if keyHex set)
+ * @param {string} [keyHex] Override for the B field – lets tests inject
+ *                          malformed (non-hex) key data.
+ */
+function buildOpContAuthSalt(salt, serverB, keyHex) {
+    const bHex = keyHex !== undefined ? keyHex : srp.hexPad(serverB.toString(16));
+
+    const authBlr = new BlrWriter(4 + salt.length + 4 + bHex.length);
+    authBlr.addWord(salt.length);
+    authBlr.ensure(salt.length);
+    authBlr.buffer.write(salt, authBlr.pos, 'utf8');
+    authBlr.pos += salt.length;
+    authBlr.addWord(bHex.length);
+    authBlr.ensure(bHex.length);
+    authBlr.buffer.write(bHex, authBlr.pos, 'utf8');
+    authBlr.pos += bHex.length;
+
+    const w = new XdrWriter(128 + authBlr.pos);
+    w.addInt(Const.op_cont_auth);
+    w.addBlr(authBlr);              // XDR array: BLR auth data (salt + B)
+    w.addString('Srp', 'utf8');     // plugin name
+    w.addString('', 'utf8');        // plist
+    w.addString('', 'utf8');        // pkey
+    return w.getData();
+}
+
+/**
  * Build an op_accept frame (opcode 3) – sent after SRP mutual auth completes.
  *
  * Wire format:
@@ -903,6 +952,119 @@ describe('Firebird SRP Authentication – offline protocol tests', function () {
             assert.ok(/^[0-9a-f]+$/i.test(capturedM1), 'M1 should be valid hex');
             assert.strictEqual(capturedPlugin, 'Srp', 'plugin should be Srp');
         } finally {
+            await stopMockServer(server);
+        }
+    });
+
+    /**
+     * Production crash regression: the server answers the client public key
+     * with op_cont_auth carrying an EMPTY data array (no salt+key yet). The
+     * driver used to crash the whole process with an uncaughtException
+     * ("Cannot read properties of undefined (reading 'readUInt16LE')").
+     * The client must instead restart the handshake by re-sending its public
+     * key, then complete auth normally once the server delivers salt+B.
+     */
+    it('should restart the SRP handshake when the server sends op_cont_auth with empty data', async function () {
+        const protocolVersion = Const.PROTOCOL_VERSION16;
+        const serverKeys = srp.serverSeed(SRP_TEST_USER, SRP_TEST_PASSWORD, SRP_TEST_SALT);
+
+        let contAuthCount = 0;
+
+        const { server, port } = await startMockServer(socket => {
+            makeFullDispatcher(socket, (s, opcode, buf) => {
+                if (opcode === Const.op_connect) {
+                    // Accept without salt+key: client continues via op_cont_auth
+                    s.write(buildOpCondAcceptSRPEmpty(protocolVersion));
+                } else if (opcode === Const.op_cont_auth) {
+                    contAuthCount++;
+                    if (contAuthCount === 1) {
+                        // Client sent its public key A – reply with EMPTY data
+                        // (the exact frame that crashed the driver in production)
+                        s.write(buildOpContAuthServer());
+                    } else if (contAuthCount === 2) {
+                        // Client restarted the handshake – now deliver salt + B
+                        s.write(buildOpContAuthSalt(SRP_TEST_SALT, serverKeys.public));
+                    } else {
+                        // Client sent M1 – finish auth
+                        s.write(Buffer.concat([
+                            buildOpContAuthServer(),
+                            buildOpAccept(protocolVersion),
+                        ]));
+                    }
+                } else if (opcode === Const.op_attach || opcode === Const.op_create) {
+                    s.write(buildOpResponse(42));
+                } else if (opcode === Const.op_detach) {
+                    s.write(buildOpResponse(0));
+                    s.end();
+                }
+                return buf.length;
+            });
+        });
+
+        try {
+            const db = await withMockSrpAttach(port);
+            assert.ok(db, 'db should attach after handshake restart');
+            assert.strictEqual(contAuthCount, 3, 'client should have sent A, restarted with A, then M1');
+            await new Promise((resolve, reject) => db.detach(e => (e ? reject(e) : resolve())));
+        } finally {
+            await stopMockServer(server);
+        }
+    });
+
+    it('should fail with an error (not an uncaughtException) when the server keeps sending empty op_cont_auth', async function () {
+        const protocolVersion = Const.PROTOCOL_VERSION16;
+        const clientSockets = [];
+
+        const { server, port } = await startMockServer(socket => {
+            clientSockets.push(socket);
+            makeFullDispatcher(socket, (s, opcode, buf) => {
+                if (opcode === Const.op_connect) {
+                    s.write(buildOpCondAcceptSRPEmpty(protocolVersion));
+                } else if (opcode === Const.op_cont_auth) {
+                    s.write(buildOpContAuthServer());   // always empty – misbehaving server
+                }
+                return buf.length;
+            });
+        });
+
+        try {
+            await assert.rejects(
+                withMockSrpAttach(port),
+                /Empty op_cont_auth data/,
+                'attach should fail with a descriptive error instead of crashing the process'
+            );
+        } finally {
+            clientSockets.forEach(s => s.destroy());
+            await stopMockServer(server);
+        }
+    });
+
+    it('should turn a synchronous decoder fault into a connection error (not an uncaughtException)', async function () {
+        const protocolVersion = Const.PROTOCOL_VERSION16;
+        const clientSockets = [];
+
+        const { server, port } = await startMockServer(socket => {
+            clientSockets.push(socket);
+            makeFullDispatcher(socket, (s, opcode, buf) => {
+                if (opcode === Const.op_connect) {
+                    s.write(buildOpCondAcceptSRPEmpty(protocolVersion));
+                } else if (opcode === Const.op_cont_auth) {
+                    // Salt frame whose server key B is not valid hex:
+                    // BigInt('0xzz…') throws synchronously inside decodeResponse.
+                    s.write(buildOpContAuthSalt(SRP_TEST_SALT, null, 'zz'.repeat(32)));
+                }
+                return buf.length;
+            });
+        });
+
+        try {
+            await assert.rejects(
+                withMockSrpAttach(port),
+                /Cannot convert/,
+                'the decoder fault should surface as a connection error on the pending operation'
+            );
+        } finally {
+            clientSockets.forEach(s => s.destroy());
             await stopMockServer(server);
         }
     });
