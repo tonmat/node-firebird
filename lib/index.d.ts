@@ -82,6 +82,8 @@ declare module 'node-firebird' {
      */
     export const ISOLATION_SERIALIZABLE: number[];
     export const ISOLATION_READ_COMMITTED_READ_ONLY: number[];
+    /** READ COMMITTED with NO RECORD VERSION: readers block until concurrent uncommitted writers finish (upstream default before this fork changed it to rec_version). */
+    export const ISOLATION_READ_COMMITTED_NO_REC_VERSION: number[];
 
     export type Isolation = number[];
 
