@@ -54,6 +54,8 @@ export const ISOLATION_REPEATABLE_READ: number[] = Const.ISOLATION_REPEATABLE_RE
  */
 export const ISOLATION_SERIALIZABLE: number[] = Const.ISOLATION_SERIALIZABLE;
 export const ISOLATION_READ_COMMITTED_READ_ONLY: number[] = Const.ISOLATION_READ_COMMITTED_READ_ONLY;
+/** READ COMMITTED with NO RECORD VERSION: readers block until concurrent uncommitted writers finish (upstream default before this fork changed it to rec_version). */
+export const ISOLATION_READ_COMMITTED_NO_REC_VERSION: number[] = Const.ISOLATION_READ_COMMITTED_NO_REC_VERSION;
 
 // Database Parameter Buffer (DPB) constants
 export const isc_dpb_version1: number = Const.isc_dpb_version1;
