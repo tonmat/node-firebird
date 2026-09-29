@@ -172,17 +172,24 @@ function withMockSrpAttach(port) {
     }));
 }
 
+/** Record, from the moment the server accepts it, when the client closes
+ *  the socket — the close may happen before the test starts waiting. */
+function trackClose(socket) {
+    socket.clientClosed = new Promise(resolve => socket.once('close', resolve));
+    return socket;
+}
+
 /** Resolves when the server side sees the client close its socket. */
 function whenClientCloses(socket, timeoutMs) {
-    return new Promise((resolve, reject) => {
-        const timer = setTimeout(
-            () => reject(new Error('client kept the socket open for ' + timeoutMs + 'ms')),
-            timeoutMs);
-        socket.once('close', () => {
-            clearTimeout(timer);
-            resolve();
-        });
-    });
+    let timer;
+    return Promise.race([
+        socket.clientClosed.finally(() => clearTimeout(timer)),
+        new Promise((resolve, reject) => {
+            timer = setTimeout(
+                () => reject(new Error('client kept the socket open for ' + timeoutMs + 'ms')),
+                timeoutMs);
+        }),
+    ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -299,5 +306,140 @@ describe('tonmat fork – default READ COMMITTED isolation', function () {
     it('should keep the blocking no_rec_version variant available by name', function () {
         assert.deepStrictEqual(Firebird.ISOLATION_READ_COMMITTED_NO_REC_VERSION,
             [Const.isc_tpb_read_committed, Const.isc_tpb_no_rec_version]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Failed connections must not leak their socket
+// ---------------------------------------------------------------------------
+
+describe('tonmat fork – failed connections release their socket', function () {
+
+    /** Server that authenticates, then rejects op_attach with I/O error. */
+    function startRejectingAttachServer(onClientSocket) {
+        return startMockServer(socket => {
+            onClientSocket(trackClose(socket));
+            makeFullDispatcher(socket, (s, opcode, buf) => {
+                if (opcode === Const.op_connect) {
+                    s.write(buildOpAcceptData());
+                } else if (opcode === Const.op_attach) {
+                    s.write(buildOpResponseError(Const.isc_io_error || 335544344,
+                        'open', '/mock/missing.fdb'));
+                }
+                return buf.length;
+            });
+        });
+    }
+
+    it('should close the socket when op_attach fails (e.g. missing database file)', async function () {
+        let serverSide;
+        const { server, port } = await startRejectingAttachServer(s => { serverSide = s; });
+
+        try {
+            await assert.rejects(attachAsync(Object.assign({}, MOCK_OPTIONS, { port })),
+                err => err.gdscode === 335544344);
+            await whenClientCloses(serverSide, 1000);
+        } finally {
+            if (serverSide) serverSide.destroy();
+            await stopMockServer(server);
+        }
+    });
+
+    it('should close the socket when op_connect is rejected', async function () {
+        let serverSide;
+        const { server, port } = await startMockServer(socket => {
+            serverSide = trackClose(socket);
+            makeFullDispatcher(socket, (s, opcode, buf) => {
+                if (opcode === Const.op_connect) {
+                    s.write(buildOpResponseError(335544472)); // login rejected
+                }
+                return buf.length;
+            });
+        });
+
+        try {
+            await assert.rejects(attachAsync(Object.assign({}, MOCK_OPTIONS, { port })), Error);
+            await whenClientCloses(serverSide, 1000);
+        } finally {
+            if (serverSide) serverSide.destroy();
+            await stopMockServer(server);
+        }
+    });
+
+    it('should free the pool slot and close the socket when a pooled attach fails', async function () {
+        const serverSides = [];
+        const { server, port } = await startRejectingAttachServer(s => { serverSides.push(s); });
+        const pool = Firebird.pool(1, Object.assign({}, MOCK_OPTIONS, { port }));
+
+        try {
+            for (let i = 0; i < 3; i++) {
+                await assert.rejects(new Promise((resolve, reject) => {
+                    pool.get((err, db) => (err ? reject(err) : resolve(db)));
+                }), err => err.gdscode === 335544344);
+            }
+            assert.strictEqual(serverSides.length, 3, 'every get() should retry the attach');
+            assert.strictEqual(pool._creating, 0, 'failed attaches must release their slot');
+            assert.strictEqual(pool.totalCount, 0);
+            await Promise.all(serverSides.map(s => whenClientCloses(s, 1000)));
+        } finally {
+            pool.destroy();
+            serverSides.forEach(s => s.destroy());
+            await stopMockServer(server);
+        }
+    });
+
+    it('should report the outcome of an attach once, even if the socket fails afterwards', async function () {
+        let serverSide;
+        const { server, port } = await startMockServer(socket => {
+            serverSide = socket;
+            makeFullDispatcher(socket, (s, opcode, buf) => {
+                if (opcode === Const.op_connect) {
+                    s.write(buildOpAcceptData());
+                } else if (opcode === Const.op_attach) {
+                    s.write(buildOpResponse(42));
+                }
+                return buf.length;
+            });
+        });
+
+        let calls = 0;
+        try {
+            const db = await new Promise((resolve, reject) => {
+                Firebird.attach(Object.assign({}, MOCK_OPTIONS, { port }), (err, d) => {
+                    calls++;
+                    if (err) reject(err); else resolve(d);
+                });
+            });
+            db.on('error', () => {});   // the reset below is expected
+            // RST instead of FIN: the client socket emits 'error' (ECONNRESET)
+            serverSide.resetAndDestroy();
+            await new Promise(resolve => setTimeout(resolve, 200));
+            assert.strictEqual(calls, 1, 'the attach callback must not fire again on a later socket error');
+        } finally {
+            await stopMockServer(server);
+        }
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Same leak against a real server: attaching a database file that does not
+// exist is the production case (one attach per missing branch database).
+// ---------------------------------------------------------------------------
+
+describe('tonmat fork – failed attach against a real server', function () {
+
+    it('should close the socket after the server reports a missing database file', async function () {
+        const options = Object.assign({}, Config.default, {
+            database: Config.default.database.replace(/[^/\\]+$/, 'missing-' + Date.now() + '.fdb'),
+        });
+
+        await assert.rejects(attachAsync(options), Error);
+        const cnx = Firebird.connection;
+        assert.ok(cnx, 'attach() exposes its connection');
+        // closing is asynchronous: give the FIN/close round trip a moment
+        for (let i = 0; i < 50 && !cnx._socket.destroyed; i++) {
+            await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        assert.ok(cnx._socket.destroyed, 'the failed connection must not keep its socket open');
     });
 });

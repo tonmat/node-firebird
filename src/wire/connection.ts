@@ -306,6 +306,22 @@ class Connection {
 
         var self = this;
 
+        // The callback reports the outcome of opening the socket, so it must
+        // run once. 'error' and 'close' also fire long after 'connect' (a
+        // reset of an attached connection, a server closing mid-handshake):
+        // calling it again made attach() report a second outcome for the
+        // same attempt — a failure after a success, or even a bare "success"
+        // (self.error unset on a clean close) that restarted the handshake
+        // on the closed socket — and made the pool release the slot twice.
+        var openCallback = callback;
+        callback = function(err?: any) {
+            var cb = openCallback;
+            openCallback = undefined;
+            if (cb) {
+                cb(err);
+            }
+        };
+
         self._socket.on('close', function() {
 
             if (!self._isOpened || self._isDetach) {

@@ -196,6 +196,34 @@ export const SQL_TYPES: Readonly<Record<string, number>> = Object.freeze({
  */
 export let connection: Connection | undefined;
 
+/**
+ * Close the socket of a connection whose connect/attach/create failed.
+ * The caller never receives a Database for it, so nothing else would ever
+ * close it: the TCP connection would stay established on both ends, with no
+ * attachment behind it, until the process exits — one leaked socket (and one
+ * server port) per failed attempt, e.g. per attach of a missing database file.
+ */
+function releaseFailedConnection(cnx: Connection): void {
+    // an intentional close: skip the lost-connection handling (pending
+    // callbacks were already answered, and there is nothing to reconnect)
+    cnx._isDetach = true;
+    if (cnx._socket && !cnx._socket.destroyed) {
+        cnx._socket.destroy();
+    }
+}
+
+/** Wrap a connect-phase callback so a failure also releases the socket. */
+function releaseOnError<T extends (err: any, ...rest: any[]) => void>(cnx: Connection, callback: T): T {
+    return function(err: any, ...rest: any[]) {
+        if (err) {
+            releaseFailedConnection(cnx);
+        }
+        if (callback) {
+            callback(err, ...rest);
+        }
+    } as T;
+}
+
 export function attach(options: Options | string, callback: DatabaseCallback): void;
 export function attach(options: SvcMgrOptions, callback: ServiceManagerCallback): void;
 export function attach(options: any, callback: any): void {
@@ -206,18 +234,20 @@ export function attach(options: any, callback: any): void {
     var cnx = connection = new Connection(host, port, function(err: any) {
 
         if (err) {
+            releaseFailedConnection(cnx);
             doError(err, callback);
             return;
         }
 
         cnx.connect(options, function(err: any) {
             if (err) {
+                releaseFailedConnection(cnx);
                 doError(err, callback);
             } else {
                 if (manager)
-                    cnx.svcattach(options, callback);
+                    cnx.svcattach(options, releaseOnError(cnx, callback));
                 else
-                    cnx.attach(options, callback);
+                    cnx.attach(options, releaseOnError(cnx, callback));
             }
         });
 
@@ -244,18 +274,20 @@ export function create(options: Options | string, callback: DatabaseCallback): v
         var self = cnx;
 
         if (err) {
+            releaseFailedConnection(cnx);
             callback({ error: err, message: "Connect error" }, undefined as any);
             return;
         }
 
         cnx.connect(options, function(err: any) {
             if (err) {
+                releaseFailedConnection(cnx);
                 if (self.db) self.db.emit('error', err);
                 doError(err, callback);
                 return;
             }
 
-            cnx.createDatabase(options, callback as any);
+            cnx.createDatabase(options, releaseOnError(cnx, callback as any));
         });
     }, options);
 }
@@ -271,6 +303,7 @@ export function attachOrCreate(options: Options | string, callback: DatabaseCall
         var self = cnx;
 
         if (err) {
+            releaseFailedConnection(cnx);
             callback({ error: err, message: "Connect error" }, undefined as any);
             return;
         }
@@ -278,6 +311,7 @@ export function attachOrCreate(options: Options | string, callback: DatabaseCall
         cnx.connect(options, function(err: any) {
 
             if (err) {
+                releaseFailedConnection(cnx);
                 doError(err, callback);
                 return;
             }
@@ -293,7 +327,8 @@ export function attachOrCreate(options: Options | string, callback: DatabaseCall
                     return;
                 }
 
-                cnx.createDatabase(options, callback as any);
+                // a failed attach falls through to create on the same socket
+                cnx.createDatabase(options, releaseOnError(cnx, callback as any));
             });
         });
 
