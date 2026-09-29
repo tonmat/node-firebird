@@ -170,6 +170,9 @@ class Connection {
     _messageFile: string;
     _authStartTime: number | undefined;
     _pendingAccept: any;
+    /** SRP plugins the server already asked to (re)start with an empty
+     *  op_cont_auth — each may do so once, see decodeResponse */
+    _contAuthRestarts: Set<string> | undefined;
     _inlineBlobs: Map<string, Buffer> | undefined;
 
     constructor(host: string, port: number, callback: SimpleCallback | undefined, options: InternalOptions, db?: Database, svc?: ServiceManager) {
@@ -405,9 +408,12 @@ class Connection {
             while (xdr.pos < xdr.buffer.length) {
                 var cb = self._queue[0], pos = xdr.pos;
                 var lazySnapshot = cb ? cb.lazy_count : undefined;
-    
+                var dispatched = false;
+
+                try {
                 decodeResponse(xdr, cb, self, self._lowercase_keys, function (err, obj) {
-    
+                    dispatched = true;
+
                     if (err) {
                         if (err instanceof RangeError) {
                             // Genuinely incomplete packet – buffer the remaining bytes
@@ -504,7 +510,28 @@ class Connection {
                     }
 
                 });
-    
+                } catch (ex: any) {
+                    // Thrown by the caller's own callback: not ours to handle.
+                    if (dispatched) {
+                        throw ex;
+                    }
+                    // decodeResponse runs inside a socket 'data' event, so a
+                    // synchronous decoder fault here would become an
+                    // uncaughtException and kill the whole process. Fail the
+                    // pending operation and drop the connection instead; the
+                    // wire state is undefined after a decoder fault, so the
+                    // buffer cannot be reused.
+                    self.error = ex;
+                    if (cb) {
+                        self._queue.shift();
+                        self._pending.shift();
+                        doError(ex, cb);
+                    }
+                    delete self._xdr;
+                    self._socket.destroy();
+                    return;
+                }
+
                 if (xdr.pos === 0) {
                     break;
                 }
@@ -3055,6 +3082,19 @@ function decodeResponse(data: XdrReader, callback: QueueCallback | undefined, cn
                         // failed) and asks the client to start it: answer with our
                         // public key A, then the server replies with salt + B (#438).
                         if (!d.buffer || d.buffer.length === 0) {
+                            // Each plugin may be (re)started once: a server that
+                            // keeps answering with empty frames would otherwise
+                            // bounce the key exchange forever and the login would
+                            // never complete nor fail.
+                            if (!cnx._contAuthRestarts) {
+                                cnx._contAuthRestarts = new Set();
+                            }
+                            if (cnx._contAuthRestarts.has(pluginName)) {
+                                var errEmpty = new Error('Empty op_cont_auth data for ' + pluginName + ' login');
+                                doError(errEmpty, callback);
+                                return cb(errEmpty);
+                            }
+                            cnx._contAuthRestarts.add(pluginName);
                             if (!cnx.clientKeys) {
                                 cnx.clientKeys = srp.clientSeed();
                             }

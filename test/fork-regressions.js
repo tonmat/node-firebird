@@ -186,6 +186,106 @@ function whenClientCloses(socket, timeoutMs) {
 }
 
 // ---------------------------------------------------------------------------
+// SRP handshake robustness (fork 2.3.4-b)
+// ---------------------------------------------------------------------------
+
+describe('tonmat fork – SRP handshake robustness', function () {
+
+    /**
+     * Production crash regression: the server answered the client public key
+     * with op_cont_auth carrying an EMPTY data array (no salt+key yet), which
+     * used to kill the process with an uncaughtException. The client must
+     * restart the handshake by re-sending its public key, then complete auth
+     * once the server delivers salt+B.
+     */
+    it('should restart the SRP handshake when the server sends op_cont_auth with empty data', async function () {
+        const protocolVersion = Const.PROTOCOL_VERSION16;
+        const serverKeys = srp.serverSeed(SRP_TEST_USER, SRP_TEST_PASSWORD, SRP_TEST_SALT);
+        let contAuthCount = 0;
+
+        const { server, port } = await startMockServer(socket => {
+            makeFullDispatcher(socket, (s, opcode, buf) => {
+                if (opcode === Const.op_connect) {
+                    s.write(buildOpCondAcceptSrpEmpty(protocolVersion));
+                } else if (opcode === Const.op_cont_auth) {
+                    contAuthCount++;
+                    if (contAuthCount === 1) {
+                        // client sent its public key A – reply with EMPTY data
+                        s.write(buildOpContAuthEmpty());
+                    } else if (contAuthCount === 2) {
+                        // client restarted the handshake – now deliver salt + B
+                        s.write(buildOpContAuthSalt(SRP_TEST_SALT, serverKeys.public));
+                    } else {
+                        // client sent M1 – finish auth
+                        s.write(Buffer.concat([buildOpContAuthEmpty(), buildOpAccept(protocolVersion)]));
+                    }
+                } else if (opcode === Const.op_attach) {
+                    s.write(buildOpResponse(42));
+                } else if (opcode === Const.op_detach) {
+                    s.write(buildOpResponse(0));
+                    s.end();
+                }
+                return buf.length;
+            });
+        });
+
+        try {
+            const db = await withMockSrpAttach(port);
+            assert.ok(db, 'db should attach after the handshake restart');
+            assert.strictEqual(contAuthCount, 3, 'client should send A, restart with A, then M1');
+            await new Promise((resolve, reject) => db.detach(e => (e ? reject(e) : resolve())));
+        } finally {
+            await stopMockServer(server);
+        }
+    });
+
+    it('should fail with an error (not an uncaughtException) when the server keeps sending empty op_cont_auth', async function () {
+        const clientSockets = [];
+        const { server, port } = await startMockServer(socket => {
+            clientSockets.push(socket);
+            makeFullDispatcher(socket, (s, opcode, buf) => {
+                if (opcode === Const.op_connect) {
+                    s.write(buildOpCondAcceptSrpEmpty(Const.PROTOCOL_VERSION16));
+                } else if (opcode === Const.op_cont_auth) {
+                    s.write(buildOpContAuthEmpty());   // misbehaving server: always empty
+                }
+                return buf.length;
+            });
+        });
+
+        try {
+            await assert.rejects(withMockSrpAttach(port), Error);
+        } finally {
+            clientSockets.forEach(s => s.destroy());
+            await stopMockServer(server);
+        }
+    });
+
+    it('should turn a synchronous decoder fault into a connection error (not an uncaughtException)', async function () {
+        const clientSockets = [];
+        const { server, port } = await startMockServer(socket => {
+            clientSockets.push(socket);
+            makeFullDispatcher(socket, (s, opcode, buf) => {
+                if (opcode === Const.op_connect) {
+                    s.write(buildOpCondAcceptSrpEmpty(Const.PROTOCOL_VERSION16));
+                } else if (opcode === Const.op_cont_auth) {
+                    // server key B that is not valid hex
+                    s.write(buildOpContAuthSalt(SRP_TEST_SALT, null, 'zz'.repeat(32)));
+                }
+                return buf.length;
+            });
+        });
+
+        try {
+            await assert.rejects(withMockSrpAttach(port), Error);
+        } finally {
+            clientSockets.forEach(s => s.destroy());
+            await stopMockServer(server);
+        }
+    });
+});
+
+// ---------------------------------------------------------------------------
 // Default isolation (fork 2.3.4-c)
 // ---------------------------------------------------------------------------
 
